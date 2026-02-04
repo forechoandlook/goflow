@@ -2,7 +2,6 @@ package flows
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	goflow "goflow"
 	"goflow/kv"
@@ -336,78 +335,96 @@ func (f *Flow) Run(ctx context.Context, shared map[string]any) (runErr error) {
 			return fmt.Errorf("max steps exceeded: %d", f.maxSteps)
 		}
 
-		select {
-		case <-ctx.Done():
-			if f.checkpointEnabled && f.kvStore != nil {
-				_ = f.saveCheckpoint(current.Name(), steps, shared)
-			}
-			return ctx.Err()
-		default:
-		}
+		var shouldContinue bool
+		var err error
+		var nextNode Node
 
-		f.emitEvent(ctx, FlowEvent{
-			Type:   FlowEventTypeNodeStart,
-			Node:   current.Name(),
-			Shared: snapshotShared(shared),
-		})
-
-		result, attempts, err := f.runNodeWithAttributes(ctx, current, shared)
+		nextNode, shouldContinue, err = f.executeStep(ctx, current, shared, steps)
 		if err != nil {
-			if f.checkpointEnabled && f.kvStore != nil {
-				_ = f.saveCheckpoint(current.Name(), steps, shared)
-			}
-
-			f.emitEvent(ctx, FlowEvent{
-				Type:    FlowEventTypeNodeError,
-				Node:    current.Name(),
-				Err:     err,
-				Attempt: attempts,
-				Shared:  snapshotShared(shared),
-			})
-
 			return err
 		}
 
-		action := goflow.ActionFromResult(result)
-		signals := goflow.SignalsFromResult(result)
-
-		f.emitEvent(ctx, FlowEvent{
-			Type:    FlowEventTypeNodeEnd,
-			Node:    current.Name(),
-			Action:  action,
-			Result:  result,
-			Attempt: attempts,
-			Signals: signals,
-			Shared:  snapshotShared(shared),
-		})
-
-		f.emitSignals(ctx, current, signals, shared)
-
-		if action == "" || action == goflow.ActionEnd {
+		if !shouldContinue {
 			break
 		}
 
-		if f.checkpointEnabled && f.kvStore != nil {
-			_ = f.saveCheckpoint(current.Name(), steps, shared)
-		}
-
-		f.mutex.RLock()
-		nextName, ok := f.transitions[current.Name()][action]
-		f.mutex.RUnlock()
-
-		if !ok || nextName == "" {
-			break
-		}
-
-		f.mutex.RLock()
-		current = f.nodes[nextName]
-		f.mutex.RUnlock()
-
+		current = nextNode
 		steps++
 		lastNodeName = current.Name()
 	}
 
 	return nil
+}
+
+func (f *Flow) executeStep(ctx context.Context, current Node, shared map[string]any, steps int) (Node, bool, error) {
+	select {
+	case <-ctx.Done():
+		if f.checkpointEnabled && f.kvStore != nil {
+			_ = f.saveCheckpoint(current.Name(), steps, shared)
+		}
+		return nil, false, ctx.Err()
+	default:
+	}
+
+	f.emitEvent(ctx, FlowEvent{
+		Type:   FlowEventTypeNodeStart,
+		Node:   current.Name(),
+		Shared: snapshotShared(shared),
+	})
+
+	result, attempts, err := f.runNodeWithAttributes(ctx, current, shared)
+	if err != nil {
+		if f.checkpointEnabled && f.kvStore != nil {
+			_ = f.saveCheckpoint(current.Name(), steps, shared)
+		}
+
+		f.emitEvent(ctx, FlowEvent{
+			Type:    FlowEventTypeNodeError,
+			Node:    current.Name(),
+			Err:     err,
+			Attempt: attempts,
+			Shared:  snapshotShared(shared),
+		})
+
+		return nil, false, err
+	}
+
+	action := goflow.ActionFromResult(result)
+	signals := goflow.SignalsFromResult(result)
+
+	f.emitEvent(ctx, FlowEvent{
+		Type:    FlowEventTypeNodeEnd,
+		Node:    current.Name(),
+		Action:  action,
+		Result:  result,
+		Attempt: attempts,
+		Signals: signals,
+		Shared:  snapshotShared(shared),
+	})
+
+	f.emitSignals(ctx, current, signals, shared)
+
+	if action == "" || action == goflow.ActionEnd {
+		return nil, false, nil
+	}
+
+	if f.checkpointEnabled && f.kvStore != nil {
+		_ = f.saveCheckpoint(current.Name(), steps, shared)
+	}
+
+	f.mutex.RLock()
+	nextName, ok := f.transitions[current.Name()][action]
+	f.mutex.RUnlock()
+
+	if !ok || nextName == "" {
+		return nil, false, nil
+	}
+
+	f.mutex.RLock()
+	nextNode := f.nodes[nextName]
+	f.mutex.RUnlock()
+
+	return nextNode, true, nil
 }
 
 func (f *Flow) runNodeWithAttributes(ctx context.Context, node Node, shared map[string]any) (goflow.NodeResult, int, error) {
@@ -449,94 +466,6 @@ func (f *Flow) runNodeWithAttributes(ctx context.Context, node Node, shared map[
 	}
 }
 
-func (f *Flow) emitSignals(ctx context.Context, node Node, signals []string, shared map[string]any) {
-	if len(signals) == 0 {
-		return
-	}
-
-	f.emitEvent(ctx, FlowEvent{
-		Type:    FlowEventTypeSignalEmitted,
-		Node:    node.Name(),
-		Signals: signals,
-		Shared:  snapshotShared(shared),
-	})
-
-	for _, signal := range signals {
-		f.mutex.RLock()
-		listeners := append([]Node(nil), f.signalListeners[signal]...)
-		f.mutex.RUnlock()
-
-		for _, listener := range listeners {
-			go f.runSignalListener(ctx, listener, shared)
-		}
-	}
-}
-
-func (f *Flow) runSignalListener(ctx context.Context, node Node, shared map[string]any) {
-	_, _, _ = f.runNodeWithAttributes(ctx, node, shared)
-}
-
-// restoreFromCheckpoint attempts to restore the flow state from checkpoint
-func (f *Flow) restoreFromCheckpoint() (map[string]any, error) {
-	if f.kvStore == nil || f.flowID == "" {
-		return nil, fmt.Errorf("KV store not initialized or flow ID not set")
-	}
-
-	key := fmt.Sprintf("flow_%s_state", f.flowID)
-	value, err := f.kvStore.Get(key)
-	if err != nil {
-		return nil, err
-	}
-
-	var state map[string]any
-	if err := json.Unmarshal(value, &state); err != nil {
-		return nil, err
-	}
-
-	return state, nil
-}
-
-// saveCheckpoint saves the current flow state
-func (f *Flow) saveCheckpoint(currentNodeName string, stepCount int, sharedState map[string]any) error {
-	if f.kvStore == nil || f.flowID == "" {
-		return fmt.Errorf("KV store not initialized or flow ID not set")
-	}
-
-	// Create a copy of the shared state and add execution metadata
-	checkpointData := make(map[string]any)
-	for k, v := range sharedState {
-		checkpointData[k] = v
-	}
-	checkpointData["current_node"] = currentNodeName
-	checkpointData["step_count"] = stepCount
-
-	// Serialize the state
-	jsonData, err := json.Marshal(checkpointData)
-	if err != nil {
-		return err
-	}
-
-	key := fmt.Sprintf("flow_%s_state", f.flowID)
-	return f.kvStore.Put(key, jsonData)
-}
-
-func (f *Flow) emitEvent(ctx context.Context, event FlowEvent) {
-	f.monitorMux.RLock()
-	monitors := append([]FlowMonitor(nil), f.monitors...)
-	f.monitorMux.RUnlock()
-
-	if len(monitors) == 0 {
-		return
-	}
-
-	if event.Timestamp.IsZero() {
-		event.Timestamp = time.Now()
-	}
-
-	for _, monitor := range monitors {
-		monitor.Notify(ctx, event)
-	}
-}
 
 func snapshotShared(shared map[string]any) map[string]any {
 	if shared == nil {

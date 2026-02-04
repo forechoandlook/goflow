@@ -27,9 +27,11 @@ goflow/
 │   └── goflow/
 │       └── main.go         # Example application
 ├── flows/
+│   ├── checkpoint.go       # Checkpoint logic
+│   ├── events.go           # Event and signal logic
 │   └── flow.go             # Flow implementation
 ├── nodes/
-│   └── basic_nodes.go      # Various node implementations
+│   └── ...                 # Various node implementations (llm_node.go, etc.)
 ├── checkpointer/
 │   └── checkpointer.go     # Checkpointing functionality
 ├── kv/
@@ -176,7 +178,11 @@ err := checkpointer.RunWithCheckpoint(context.Background(), flow, threadID, init
 - `LuaNode`: Executes a Lua script that receives the shared map, mutates it, and can return actions/signals; useful for rapid, script-driven customization.
   Shared keys are exported as `GOFLOW_SHARED_<KEY>` environment variables (JSON-encoded), and the script can emit `key=value` lines on stdout to feed updates/action names back to the flow.
 
-### Node Retry Wrapper Example
+### Reliability: Retries and Timeouts
+
+GoFlow provides mechanisms to handle failures gracefully using retries and timeouts.
+
+#### Node Retries
 
 Flows inspect `nodes.AttributeAwareNode`, so you can decorate any node with attributes (retries, delays, etc.) without modifying the implementation. Wrap the node before wiring it into the flow:
 
@@ -192,6 +198,26 @@ err := flow.Run(ctx, shared)
 ```
 
 `Flow.Run` will rerun the wrapped node on errors up to `RetryAttempts` and respect the optional `RetryDelay`.
+
+#### Node Timeouts
+
+To prevent a node from blocking indefinitely, you can wrap it with a timeout using `utils.WithTimeoutOnNode` (or similar helper):
+
+```go
+// Create a node that times out after 1 second
+timedNode := utils.WithTimeoutOnNode(myNode, 1*time.Second)
+
+flow := flows.NewFlow(timedNode)
+```
+
+You can also set a timeout for the entire flow execution via `FlowOption`:
+
+```go
+options := flows.FlowOption{
+    Timeout: 30 * time.Second,
+}
+flow := flows.NewFlowWithOptions(startNode, options)
+```
 
 ### Signal Listener Example
 
@@ -319,6 +345,31 @@ These helpers are available out of the box and meant to reduce boilerplate when 
   - Expanded Node Library for Integrations – The node catalog focuses on LLMs, loops, conditionals, and KV helpers. A mature diagram builder often ships
     with connectors (HTTP/webhook, DB readers/writers, data transformers, notifications) so users can drag-and-drop real-world integrations without
     writing Go code.
+
+## Testing
+
+Run all tests with:
+
+```bash
+go test ./...
+```
+
+For debugging a specific package or test:
+
+```bash
+go test ./flows -v
+go test ./flows -run TestFlow_Run
+```
+
+## Contributing
+
+1.  **Fork** the repository.
+2.  **Create** a feature branch.
+3.  **Commit** your changes following Conventional Commits (e.g., `feat: add new node type`).
+4.  **Test** your changes with `go test ./...`.
+5.  **Submit** a Pull Request.
+
+Please ensure your code follows Go idioms and is formatted with `gofmt`.
 
 ## License
 
