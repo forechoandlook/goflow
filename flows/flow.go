@@ -11,6 +11,37 @@ import (
 	"time"
 )
 
+// FlowEventType enumerates observable lifecycle hooks emitted by a flow.
+type FlowEventType string
+
+const (
+	FlowEventTypeFlowStart     FlowEventType = "flow_start"
+	FlowEventTypeNodeStart     FlowEventType = "node_start"
+	FlowEventTypeNodeEnd       FlowEventType = "node_end"
+	FlowEventTypeNodeError     FlowEventType = "node_error"
+	FlowEventTypeNodeRetry     FlowEventType = "node_retry"
+	FlowEventTypeSignalEmitted FlowEventType = "signal_emitted"
+	FlowEventTypeFlowComplete  FlowEventType = "flow_complete"
+)
+
+// FlowEvent carries metadata that observability hooks can use.
+type FlowEvent struct {
+	Type      FlowEventType
+	Timestamp time.Time
+	Node      string
+	Action    string
+	Result    goflow.NodeResult
+	Err       error
+	Attempt   int
+	Signals   []string
+	Shared    map[string]any
+}
+
+// FlowMonitor observes lifecycle events emitted by Flow.Run().
+type FlowMonitor interface {
+	Notify(ctx context.Context, event FlowEvent)
+}
+
 type Node = goflow.Node
 
 // FlowOption represents configuration options for a flow
@@ -20,6 +51,7 @@ type FlowOption struct {
 	MaxSteps         int
 	FlowID           string
 	Timeout          time.Duration
+	Monitors         []FlowMonitor
 }
 
 // Flow represents a workflow with nodes and transitions
@@ -31,6 +63,8 @@ type Flow struct {
 	mutex           sync.RWMutex
 	currentNode     Node // Track the current node for Then() method
 	signalListeners map[string][]Node
+	monitors        []FlowMonitor
+	monitorMux      sync.RWMutex
 
 	// Checkpoint and state management
 	checkpointEnabled bool
@@ -56,6 +90,7 @@ func NewFlowBuilder(start Node) *FlowBuilder {
 		flowID:            "",
 		timeout:           0,
 		signalListeners:   make(map[string][]Node),
+		monitors:          nil,
 	}
 	flow.nodes[start.Name()] = start
 
@@ -79,6 +114,10 @@ func NewFlowWithOptions(start Node, opts FlowOption) *Flow {
 		builder.WithMaxSteps(opts.MaxSteps)
 	}
 
+	if len(opts.Monitors) > 0 {
+		builder.WithMonitors(opts.Monitors...)
+	}
+
 	return builder.Build()
 }
 
@@ -100,6 +139,23 @@ func (fb *FlowBuilder) Listen(signal string, listener Node) *FlowBuilder {
 	return fb
 }
 
+// WithMonitor registers an observability hook for the flow.
+func (fb *FlowBuilder) WithMonitor(monitor FlowMonitor) *FlowBuilder {
+	if monitor == nil {
+		return fb
+	}
+	fb.flow.AddMonitor(monitor)
+	return fb
+}
+
+// WithMonitors registers multiple observability hooks for the flow.
+func (fb *FlowBuilder) WithMonitors(monitors ...FlowMonitor) *FlowBuilder {
+	for _, monitor := range monitors {
+		fb.WithMonitor(monitor)
+	}
+	return fb
+}
+
 // WithOptions applies flow options
 func (fb *FlowBuilder) WithOptions(opts FlowOption) *FlowBuilder {
 	if opts.EnableCheckpoint {
@@ -108,6 +164,10 @@ func (fb *FlowBuilder) WithOptions(opts FlowOption) *FlowBuilder {
 
 	if opts.MaxSteps > 0 {
 		fb.WithMaxSteps(opts.MaxSteps)
+	}
+
+	if len(opts.Monitors) > 0 {
+		fb.WithMonitors(opts.Monitors...)
 	}
 
 	fb.flow.timeout = opts.Timeout
@@ -134,12 +194,29 @@ func (fb *FlowBuilder) Build() *Flow {
 	return fb.flow
 }
 
+// Add attaches a node to the flow while preserving builder chaining.
+func (fb *FlowBuilder) Add(node Node) *FlowBuilder {
+	fb.flow.Add(node)
+	return fb
+}
+
 // Add adds a node to the flow
 func (f *Flow) Add(node Node) *Flow {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 	f.nodes[node.Name()] = node
 	return f // 返回自身，支持链式
+}
+
+// AddMonitor registers a FlowMonitor for the flow.
+func (f *Flow) AddMonitor(monitor FlowMonitor) *Flow {
+	if monitor == nil {
+		return f
+	}
+	f.monitorMux.Lock()
+	f.monitors = append(f.monitors, monitor)
+	f.monitorMux.Unlock()
+	return f
 }
 
 // Listen registers a node that runs asynchronously when the given signal fires.
@@ -197,11 +274,13 @@ func (f *Flow) WithMaxSteps(max int) *Flow {
 }
 
 // Run executes the flow
-func (f *Flow) Run(ctx context.Context, shared map[string]any) error {
+func (f *Flow) Run(ctx context.Context, shared map[string]any) (runErr error) {
 	f.mutex.RLock()
 	current := f.start
 	steps := 0
 	f.mutex.RUnlock()
+
+	lastNodeName := current.Name()
 
 	// Apply timeout if configured
 	if f.timeout > 0 {
@@ -214,17 +293,18 @@ func (f *Flow) Run(ctx context.Context, shared map[string]any) error {
 	if f.checkpointEnabled && f.kvStore != nil {
 		restoredState, err := f.restoreFromCheckpoint()
 		if err == nil && restoredState != nil {
-			// Restore the shared state and potentially other execution state
 			for k, v := range restoredState {
-				if k != "current_node" && k != "step_count" {
-					shared[k] = v
+				if k == "current_node" || k == "step_count" {
+					continue
 				}
+				shared[k] = v
 			}
 
-			// Restore current node and step count if available
 			if currentNodeName, ok := restoredState["current_node"].(string); ok {
 				f.mutex.RLock()
-				current = f.nodes[currentNodeName]
+				if restored, exists := f.nodes[currentNodeName]; exists {
+					current = restored
+				}
 				f.mutex.RUnlock()
 			}
 
@@ -234,47 +314,83 @@ func (f *Flow) Run(ctx context.Context, shared map[string]any) error {
 		}
 	}
 
+	lastNodeName = current.Name()
+
+	f.emitEvent(ctx, FlowEvent{
+		Type:   FlowEventTypeFlowStart,
+		Node:   current.Name(),
+		Shared: snapshotShared(shared),
+	})
+
+	defer func() {
+		f.emitEvent(ctx, FlowEvent{
+			Type:   FlowEventTypeFlowComplete,
+			Node:   lastNodeName,
+			Err:    runErr,
+			Shared: snapshotShared(shared),
+		})
+	}()
+
 	for current != nil {
-		// Check max steps
 		if f.maxSteps > 0 && steps >= f.maxSteps {
 			return fmt.Errorf("max steps exceeded: %d", f.maxSteps)
 		}
 
-		// Check context cancellation
 		select {
 		case <-ctx.Done():
-			// If checkpointing is enabled, save state before exiting
 			if f.checkpointEnabled && f.kvStore != nil {
-				f.saveCheckpoint(current.Name(), steps, shared)
+				_ = f.saveCheckpoint(current.Name(), steps, shared)
 			}
 			return ctx.Err()
 		default:
 		}
 
-		// Execute current node (respecting attribute-driven retries)
-		result, err := f.runNodeWithAttributes(ctx, current, shared)
+		f.emitEvent(ctx, FlowEvent{
+			Type:   FlowEventTypeNodeStart,
+			Node:   current.Name(),
+			Shared: snapshotShared(shared),
+		})
+
+		result, attempts, err := f.runNodeWithAttributes(ctx, current, shared)
 		if err != nil {
-			// If checkpointing is enabled, save error state
 			if f.checkpointEnabled && f.kvStore != nil {
-				f.saveCheckpoint(current.Name(), steps, shared)
+				_ = f.saveCheckpoint(current.Name(), steps, shared)
 			}
+
+			f.emitEvent(ctx, FlowEvent{
+				Type:    FlowEventTypeNodeError,
+				Node:    current.Name(),
+				Err:     err,
+				Attempt: attempts,
+				Shared:  snapshotShared(shared),
+			})
+
 			return err
 		}
 
-		f.emitSignals(ctx, result, shared)
-
-		// Check for end conditions
 		action := goflow.ActionFromResult(result)
+		signals := goflow.SignalsFromResult(result)
+
+		f.emitEvent(ctx, FlowEvent{
+			Type:    FlowEventTypeNodeEnd,
+			Node:    current.Name(),
+			Action:  action,
+			Result:  result,
+			Attempt: attempts,
+			Signals: signals,
+			Shared:  snapshotShared(shared),
+		})
+
+		f.emitSignals(ctx, current, signals, shared)
+
 		if action == "" || action == goflow.ActionEnd {
 			break
 		}
 
-		// Save checkpoint if enabled
 		if f.checkpointEnabled && f.kvStore != nil {
-			f.saveCheckpoint(current.Name(), steps, shared)
+			_ = f.saveCheckpoint(current.Name(), steps, shared)
 		}
 
-		// Find next node
 		f.mutex.RLock()
 		nextName, ok := f.transitions[current.Name()][action]
 		f.mutex.RUnlock()
@@ -288,46 +404,62 @@ func (f *Flow) Run(ctx context.Context, shared map[string]any) error {
 		f.mutex.RUnlock()
 
 		steps++
+		lastNodeName = current.Name()
 	}
 
 	return nil
 }
 
-func (f *Flow) runNodeWithAttributes(ctx context.Context, node Node, shared map[string]any) (goflow.NodeResult, error) {
+func (f *Flow) runNodeWithAttributes(ctx context.Context, node Node, shared map[string]any) (goflow.NodeResult, int, error) {
 	attrs := nodes.NodeAttributes{}
 	if aware, ok := node.(nodes.AttributeAwareNode); ok {
 		attrs = aware.Attributes()
 	}
 
-	attempts := 0
+	retries := 0
 	for {
+		attempt := retries + 1
 		result, err := node.Run(ctx, shared)
 		if err == nil {
-			return result, nil
+			return result, attempt, nil
 		}
 
-		if attempts >= attrs.RetryAttempts {
-			return nil, err
+		if retries >= attrs.RetryAttempts {
+			return nil, attempt, err
 		}
 
-		attempts++
+		f.emitEvent(ctx, FlowEvent{
+			Type:    FlowEventTypeNodeRetry,
+			Node:    node.Name(),
+			Err:     err,
+			Attempt: attempt,
+			Shared:  snapshotShared(shared),
+		})
+
+		retries++
 		if attrs.RetryDelay > 0 {
 			timer := time.NewTimer(attrs.RetryDelay)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				return nil, ctx.Err()
+				return nil, attempt, ctx.Err()
 			case <-timer.C:
 			}
 		}
 	}
 }
 
-func (f *Flow) emitSignals(ctx context.Context, result goflow.NodeResult, shared map[string]any) {
-	signals := goflow.SignalsFromResult(result)
+func (f *Flow) emitSignals(ctx context.Context, node Node, signals []string, shared map[string]any) {
 	if len(signals) == 0 {
 		return
 	}
+
+	f.emitEvent(ctx, FlowEvent{
+		Type:    FlowEventTypeSignalEmitted,
+		Node:    node.Name(),
+		Signals: signals,
+		Shared:  snapshotShared(shared),
+	})
 
 	for _, signal := range signals {
 		f.mutex.RLock()
@@ -341,7 +473,7 @@ func (f *Flow) emitSignals(ctx context.Context, result goflow.NodeResult, shared
 }
 
 func (f *Flow) runSignalListener(ctx context.Context, node Node, shared map[string]any) {
-	_, _ = f.runNodeWithAttributes(ctx, node, shared)
+	_, _, _ = f.runNodeWithAttributes(ctx, node, shared)
 }
 
 // restoreFromCheckpoint attempts to restore the flow state from checkpoint
@@ -386,6 +518,37 @@ func (f *Flow) saveCheckpoint(currentNodeName string, stepCount int, sharedState
 
 	key := fmt.Sprintf("flow_%s_state", f.flowID)
 	return f.kvStore.Put(key, jsonData)
+}
+
+func (f *Flow) emitEvent(ctx context.Context, event FlowEvent) {
+	f.monitorMux.RLock()
+	monitors := append([]FlowMonitor(nil), f.monitors...)
+	f.monitorMux.RUnlock()
+
+	if len(monitors) == 0 {
+		return
+	}
+
+	if event.Timestamp.IsZero() {
+		event.Timestamp = time.Now()
+	}
+
+	for _, monitor := range monitors {
+		monitor.Notify(ctx, event)
+	}
+}
+
+func snapshotShared(shared map[string]any) map[string]any {
+	if shared == nil {
+		return nil
+	}
+
+	copy := make(map[string]any, len(shared))
+	for k, v := range shared {
+		copy[k] = v
+	}
+
+	return copy
 }
 
 // MutexRLock acquires a read lock on the flow's mutex

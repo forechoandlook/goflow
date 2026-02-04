@@ -12,6 +12,8 @@ GoFlow is a flexible workflow engine inspired by PocketFlow and LangGraph concep
 - **KV Storage**: Built-in key-value storage for persistence
 - **Context Control**: Proper context handling with timeout and cancellation support
 - **Thread Safety**: Concurrent-safe implementations using mutexes
+- **Observability Hooks**: Register `flows.FlowMonitor` implementations to receive node/flow lifecycle events (start, retry, error, signal, complete).
+- **Lightweight DSL**: Define simple scripts using `set`, `log`, `delay`, and `signal` to drive flows without writing Go code.
 - **Conditional Branching**: Advanced conditional routing with sub-flow execution
 - **Parallel Execution**: Support for running multiple flows in parallel
 
@@ -169,6 +171,10 @@ err := checkpointer.RunWithCheckpoint(context.Background(), flow, threadID, init
 - `ParallelNode`: Executes multiple nodes in parallel
 - `TimeoutNode`: Wraps other nodes with timeout functionality
 - `NodeResult`: Nodes now return `goflow.NodeResult` maps that can include `action`, `signal`/`signals`, and other metadata. `goflow.ActionFromResult` and `goflow.SignalsFromResult` extract those values inside the flow runner.
+- `HTTPNode`: Performs a templated HTTP call, stores the response/status under shared keys, and can be configured from DSL, JSON, or runtime config.
+- `ShellNode`: Spawns an external process with shared state marshaled to stdin and captures stdout/stderr or JSON payloads back into shared.
+- `LuaNode`: Executes a Lua script that receives the shared map, mutates it, and can return actions/signals; useful for rapid, script-driven customization.
+  Shared keys are exported as `GOFLOW_SHARED_<KEY>` environment variables (JSON-encoded), and the script can emit `key=value` lines on stdout to feed updates/action names back to the flow.
 
 ### Node Retry Wrapper Example
 
@@ -214,6 +220,70 @@ err := flow.Run(ctx, shared)
 
 `FlowBuilder.Listen` wires `signalHandler` to run whenever `"llm2_done"` appears in a node’s result, and the flow continues without waiting for the listener to finish.
 
+## Observability Hooks
+
+`flows.Flow` now emits structured `flows.FlowEvent` tuples (start, node start/end, retries, errors, signals, flow completion). Implement `flows.FlowMonitor`, register it via `FlowBuilder.WithMonitor` or `FlowOption.Monitors`, and stream telemetry to logs, metrics systems, or UIs without touching the flow logic.
+
+```go
+type loggingMonitor struct{}
+
+func (loggingMonitor) Notify(ctx context.Context, event flows.FlowEvent) {
+    log.Printf("event=%s node=%s action=%s err=%v signals=%v", event.Type, event.Node, event.Action, event.Err, event.Signals)
+}
+
+flow := flows.NewFlowBuilder(startNode).
+    WithMonitor(loggingMonitor{}).
+    Build()
+```
+
+The `FlowEvent.Shared` map is a copy of the shared state when the event fired, so monitors can safely read it without racing the flow.
+
+## Lightweight DSL
+
+For quick prototypes, the `dsl` package lets you describe sequential flows with four commands: `set <key> <value>`, `log <message>`, `delay <duration>`, and `signal <name>`. Each line becomes a node whose templates can reference `{{sharedKey}}`.
+
+```go
+script := `
+set greeting Hello
+set summary "Greeting: {{greeting}}"
+log "{{summary}} is ready"
+delay 250ms
+signal ready
+`
+
+flow, err := dsl.BuildFlowFromScript(script)
+```
+
+If you need a richer graph or router-based nodes, you can still rely on the existing `flows.ParseFlowDSL` parser shown below. There you define `node ... = <type>` blocks, choose a `start`, and `connect` nodes with actions.
+
+```go
+script := `
+node seed = set prompt "请翻译成英文"
+node translator = llm input=prompt output=translation system="You are an assistant translator"
+node logger = logger "translation" translation
+start seed
+connect seed -> translator
+connect translator -> logger
+`
+
+flow, err := flows.ParseFlowDSL(script)
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+`flows.ParseFlowDSL` currently supports the `set`, `llm`, `logger`, `delay`, `http`, `shell`, and `lua` node types, and helper connections default to the `next` action when no explicit action is provided. The new `dsl` script complements it with a lightweight, text-driven control path ideal for quick edits or automation recipes.
+
+The HTTP, shell, and Lua nodes make it easy to plug in external integrations without recompiling: 
+```
+node notify = http url="https://example.com/event" method=POST body="{\"text\": \"{{.message}}\"}" response=notify_resp
+node sanitize = lua script="function run(shared) shared.cleaned = shared.raw:upper() return shared end"
+node git_status = shell git status -sb json=false
+connect notify -> sanitize
+connect sanitize -> git_status
+```
+Each DSL node accepts named arguments (e.g., `timeout=5s`, `json=true`, `output=result_key`) to control inputs/outputs, so you can keep flows data-driven.
+
 ## Default Nodes & Utilities
 
 ### LLMNode backed by go-openai
@@ -230,6 +300,25 @@ err := flow.Run(ctx, shared)
 - `DelayNode`: pauses for a configured duration while respecting the flow context.
 - `KVReadNode` / `KVWriteNode`: integrate with `kv.KVStore` (in-memory or file-based) so you can persist pieces of `shared` mid-flow.
 These helpers are available out of the box and meant to reduce boilerplate when wiring flows in `cmd/goflow` or your own integrations.
+
+## TODO 
+
+  - Graph Introspection & Serialization – flows.Flow keeps nodes/transitions maps private and has no API to serialize the graph (e.g., to DOT/JSON for a
+    UI). Without such an export, it’s hard to display the flow structure or let a diagram editor drive execution. Add a Flow.Graph() or similar that
+    enumerates registered nodes + transitions and optionally emits metadata (labels, actions). (flows/flow.go: structs & builder methods, ~lines 16‑120)
+  - External Definition & Persistence – Everything today is wired through Go code (FlowBuilder.Then, Connect, listeners). Mature flow tools allow flow
+    definitions to be loaded from YAML/JSON or a visual editor. Consider supporting a schema-driven definition that can be round‑tripped between UI and
+    runtime, including named entry points, metadata, and references to RegisteredNodes (nodes/registry.go).
+  - Typed Shared State & Validation – Shared state is map[string]any without schema or validation hooks, so connecting nodes visually (and ensuring the
+    right inputs exist) is risky. Introducing a shared-state schema/contract (or typed context helpers) plus tooling to declare each node’s expected
+    inputs/outputs would give diagram editors the signal they need to wire nodes correctly.
+  - Lifecycle Controls & Scheduling – There’s retry/delay via NodeAttributes, but no native scheduling (e.g., cron, delay until signal, pause/resume) or
+    versioned deployments. Providing schedulers, run IDs, and maybe “trigger” nodes would let flows behave like orchestrated processes.
+  - Operator-Friendly Tooling – No built-in dashboards for active flows, no history of runs, and only basic checkpointing tied to KVStore. Adding run
+    logs, status endpoints, and health checks would make the engine feel production-ready.
+  - Expanded Node Library for Integrations – The node catalog focuses on LLMs, loops, conditionals, and KV helpers. A mature diagram builder often ships
+    with connectors (HTTP/webhook, DB readers/writers, data transformers, notifications) so users can drag-and-drop real-world integrations without
+    writing Go code.
 
 ## License
 
