@@ -505,3 +505,46 @@ func (f *Flow) GetTransition(nodeName, action string) (string, bool) {
 	nextName, ok := f.transitions[nodeName][action]
 	return nextName, ok
 }
+
+// GraphNode represents a node in the flow graph
+type GraphNode struct {
+	ID   string `json:"id"`
+	Type string `json:"type"`
+}
+
+// GraphEdge represents a connection between nodes
+type GraphEdge struct {
+	From   string `json:"from"`
+	To     string `json:"to"`
+	Action string `json:"action"`
+}
+
+// Graph represents the flow topology
+type Graph struct {
+	Nodes []GraphNode `json:"nodes"`
+	Edges []GraphEdge `json:"edges"`
+}
+
+// Graph returns the flow topology
+func (f *Flow) Graph() Graph {
+	f.mutex.RLock()
+	defer f.mutex.RUnlock()
+
+	var g Graph
+	for name := range f.nodes {
+		g.Nodes = append(g.Nodes, GraphNode{ID: name, Type: "default"})
+	}
+
+	for from, actions := range f.transitions {
+		for action, to := range actions {
+			if to != "" {
+				g.Edges = append(g.Edges, GraphEdge{
+					From:   from,
+					To:     to,
+					Action: action,
+				})
+			}
+		}
+	}
+	return g
+}
